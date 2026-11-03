@@ -1,0 +1,10 @@
+conditions_of_use | https://www.amazon.com/gp/help/customer/display.html?nodeId=508088
+privacy_notice | https://www.amazon.com/gp/help/customer/display.html?nodeId=468496
+return_policy | https://www.amazon.com/gp/help/customer/display.html?nodeId=GKM69DUUYKQWKWX7
+refund_timelines | https://www.amazon.com/gp/help/customer/display.html?nodeId=GKQNFKFK5CF3C54B
+return_items | https://www.amazon.com/gp/help/customer/display.html?nodeId=201819210
+returns_third_party_sellers | https://www.amazon.com/gp/help/customer/display.html?nodeId=G38BHJQ25PNCLUBU
+replacements_exchanges | https://www.amazon.com/gp/help/customer/display.html?nodeId=GYG97JCDCUNGURQJ
+a_to_z_guarantee | https://www.amazon.com/gp/help/customer/display.html?nodeId=GQ37ZCNECJKTFYQV
+missing_package | https://www.amazon.com/gp/help/customer/display.html?nodeId=GCU8BWGTQNJKQEBS
+product_support | https://www.amazon.com/gp/help/customer/display.html?nodeId=G94W2A3Y2Y6EQQPG

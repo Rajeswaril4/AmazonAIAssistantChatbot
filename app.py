@@ -1,0 +1,181 @@
+"""Amazon AI Assistant v2: tool-calling agent (products with photos, reviews, policies, orders, returns, compare, human hand-off).
+Log in (or continue as guest); logged-in users keep their orders and chat history.
+Needs the db/ folder, a .env file with OPENROUTER_API_KEY, and (optional, for photos) images.json next to this file."""
+import os, re, time, json, html, uuid
+import chromadb, pandas as pd, streamlit as st
+from dotenv import load_dotenv
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import config, orders, auth
+from config import DB, EMBED_MODEL, RERANK_MODEL, LLM_BASE_URL, LLM_MODEL
+from agent import Toolbox, build_system, run_agent
+LLM_FALLBACK = getattr(config, "LLM_FALLBACK", None)
+
+st.set_page_config(page_title="Amazon AI Assistant", page_icon="🛒")
+
+@st.cache_resource
+def load():
+    db = chromadb.PersistentClient(path=DB)
+    cols, errors = {}, {}
+    for n in ("policy", "products", "reviews"):
+        try: cols[n] = db.get_collection(n)
+        except Exception as e: cols[n], errors[n] = None, repr(e)
+    return SentenceTransformer(EMBED_MODEL), CrossEncoder(RERANK_MODEL), cols, errors
+
+@st.cache_data
+def load_images():
+    """images.json (made by extract_images.py) maps product id -> image URL. Optional."""
+    try: return json.load(open("images.json"))
+    except Exception: return {}
+
+model, reranker, cols, errors = load()
+IMAGES = load_images()
+if cols["products"] is None:
+    st.error(f"Product index not found in '{os.path.abspath(DB)}'. Error: {errors.get('products')}\n\n"
+             "Unzip the db/ folder from Colab next to app.py, then restart.")
+    st.stop()
+load_dotenv()
+API_KEY = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or "").strip().strip("\"'“”‘’")
+if not API_KEY:
+    st.error("OPENROUTER_API_KEY not found. Create a .env file next to app.py.")
+    st.stop()
+llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
+
+def complete(msgs, tools=None, max_tokens=800):
+    """One LLM call: retry on rate limit, shrink max_tokens when credit is low (402), fall back to a second model."""
+    err = None
+    for name in [LLM_MODEL] + ([LLM_FALLBACK] if LLM_FALLBACK else []):
+        for attempt in range(3):
+            try:
+                kw = {"tools": tools} if tools else {}
+                return llm.chat.completions.create(model=name, max_tokens=max_tokens, temperature=0.2, messages=msgs, **kw).choices[0].message
+            except Exception as e:
+                err, s = e, str(e)
+                if "402" in s and (m := re.search(r"can only afford (\d+)", s)) and int(m[1]) > 250:
+                    max_tokens = int(m[1]) - 20; continue                  # low credit: ask for fewer tokens and retry
+                if "429" in s: time.sleep(2 ** (attempt + 1)); continue
+                break
+    hint = " Your OpenRouter credit is too low: add credit at https://openrouter.ai/settings/credits." if "402" in str(err) else ""
+    raise RuntimeError(f"LLM request failed: {err}{hint}")
+
+def sample_products():
+    g = cols["products"].get(limit=400, include=["metadatas"])
+    return [dict(asin=i, title=m["title"], price=m["price"]) for i, m in zip(g["ids"], g["metadatas"])]
+
+orders.init_db(); auth.init()
+tb = Toolbox(cols, lambda t: model.encode([t], normalize_embeddings=True).tolist(),
+             lambda pairs: reranker.predict(pairs))
+
+S = st.session_state
+for k, v in dict(auth=False, user=None, history=[], pending=None, last_search=None, chat_id=uuid.uuid4().hex).items(): S.setdefault(k, v)
+
+def fresh(**kw):                       # switch to another (or new) chat and redraw
+    S.update(dict(history=[], pending=None, last_search=None, chat_id=uuid.uuid4().hex) | kw); st.rerun()
+
+def add(**m):                          # show a message and save it to the user's history
+    S.history.append(m)
+    if S.user: auth.save(S.user, S.chat_id, m)
+
+# ---------- login page ----------
+if not S.auth:
+    st.title("🛒 Amazon AI Assistant")
+    st.caption("Log in to keep your orders and chat history, or continue as a guest.")
+    for tab, label, fn in zip(st.tabs(["Log in", "Sign up"]), ["Log in", "Sign up"], [auth.login, auth.register]):
+        with tab, st.form(label):
+            u, p = st.text_input("Username"), st.text_input("Password", type="password")
+            if st.form_submit_button(label):
+                user, err = fn(u, p)
+                if err: st.error(err)
+                else:
+                    orders.seed_user(user, sample_products)
+                    S.auth, S.user = True, user; fresh()
+    if st.button("Continue as guest"): S.auth, S.user = True, None; fresh()
+    st.stop()
+user = S.user
+
+# ---------- sidebar ----------
+with st.sidebar:
+    st.subheader("Account")
+    st.write(f"👤 **{user}**" if user else "👤 Guest (orders and history are not saved)")
+    if st.button("Log out" if user else "Log in / Sign up"): S.auth, S.user = False, None; fresh()
+    if st.button("➕ New chat"): fresh()
+    if user:
+        st.subheader("Chat history")
+        for cid, title in auth.chats(user):
+            a, b = st.columns([5, 1])
+            if a.button(("▶ " if cid == S.chat_id else "") + title, key=f"o{cid}", use_container_width=True): fresh(history=auth.load(user, cid), chat_id=cid)
+            if b.button("🗑", key=f"d{cid}"): auth.delete_chat(user, cid); fresh() if cid == S.chat_id else st.rerun()
+        if st.button("Reset my demo orders"): orders.reset(user, sample_products); S.pending = None; st.rerun()
+    st.subheader("What I know")
+    st.write("Products: " + ", ".join(c.replace("_", " ") for c in config.CATS))
+    st.write("Policies: returns, refunds, A-to-z Guarantee, privacy, conditions of use")
+    st.caption("Prices in USD (₹ budgets are converted). Try: 'ukulele under 50', then 'what about a cheaper one?', 'compare the first two', 'show my orders'.")
+    if not IMAGES: st.caption("No images.json found: product cards show without photos.")
+if S.pending and S.pending["user"] != user: S.pending = None
+
+# ---------- rendering ----------
+st.markdown("""<style>
+.pimg{height:170px;display:flex;align-items:center;justify-content:center;background:#fff;border-radius:8px;margin-bottom:8px;font-size:48px}
+.pimg img{max-width:100%;max-height:100%;object-fit:contain}
+.ptitle{font-weight:600;line-height:1.45em;height:2.9em;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+</style>""", unsafe_allow_html=True)
+
+def show_cards(cards):
+    for row in range(0, len(cards), 3):
+        for col, c in zip(st.columns(3), cards[row:row + 3]):       # always 3 equal columns, so every card has the same width
+            with col.container(border=True):
+                img = IMAGES.get(c["id"])
+                tag = f'<img src="{html.escape(img)}">' if img else "🛍️"
+                st.markdown(f'<div class="pimg">{tag}</div>', unsafe_allow_html=True)   # fixed-size image box
+                st.markdown(f"**{c['rating']} ★** | {c['ratings']} ratings")
+                st.markdown(f'<div class="ptitle">{html.escape(c["title"])}</div>', unsafe_allow_html=True)
+                st.markdown(f"### ${c['price']:.2f}")
+                st.caption(f"{c['category'].replace('_', ' ')} · ID {c['id']}")
+                st.markdown(f"[View on Amazon](https://www.amazon.com/dp/{c['id']})")
+
+def render(m):
+    with st.chat_message(m["role"]):
+        st.write(m["text"])
+        if m.get("cards"): show_cards(m["cards"])
+        if m.get("orders"): st.dataframe(pd.DataFrame(m["orders"]), hide_index=True)
+        if m.get("compare"): st.dataframe(pd.DataFrame(m["compare"]), hide_index=True)
+        if m.get("ticket"): st.success(f"Support ticket {m['ticket']} created. A human agent will follow up (demo).")
+        if m.get("tools"): st.caption("Tools used: " + ", ".join(dict.fromkeys(m["tools"])))
+        if m.get("sources"):
+            with st.expander("Sources"): st.write("\n\n".join(m["sources"]))
+
+for m in S.history: render(m)
+
+# ---------- confirmation buttons for actions that change data ----------
+if p := S.pending:
+    with st.container(border=True):
+        st.warning(f"Please confirm: {p['summary']}")
+        b1, b2 = st.columns(2)
+        if b1.button("✅ Confirm", key="confirm"):
+            res = orders.perform_return(p["user"], p["order_id"], p["reason"]) if p["type"] == "return" else orders.perform_cancel(p["user"], p["order_id"])
+            add(role="assistant", text=("✅ " if res["ok"] else "⚠️ ") + res["message"])
+            S.pending = None; st.rerun()
+        if b2.button("Cancel", key="decline"):
+            add(role="assistant", text="Okay, I haven't changed anything.")
+            S.pending = None; st.rerun()
+
+# ---------- new message ----------
+if q := st.chat_input("Ask about products, reviews, returns, orders..."):
+    st.chat_message("user").write(q)
+    past = [{"role": m["role"], "content": m["text"]} for m in S.history[-8:]]
+    add(role="user", text=q)
+    try:
+        with st.spinner("Working on it..."):
+            tb.start(user, q)
+            text = run_agent(complete, tb, build_system(user, ", ".join(c.replace("_", " ") for c in config.CATS), S.last_search), past, q)
+        c = tb.ctx
+        seen, cards = set(), []
+        for card in c["cards"]:                       # only show cards the answer actually mentions
+            if card["id"] in text and card["id"] not in seen: seen.add(card["id"]); cards.append(card)
+        if c["pending"]: S.pending = c["pending"]
+        if c["search"]: S.last_search = c["search"]
+        add(role="assistant", text=text, cards=cards[:6], orders=c["orders"], compare=c["compare"],
+            ticket=c["ticket"], tools=c["tools"], sources=c["sources"])
+    except Exception as e:
+        add(role="assistant", text=f"Sorry, something went wrong: {e}")
+    st.rerun()
