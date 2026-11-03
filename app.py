@@ -48,7 +48,7 @@ if not API_KEY:
 
 llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
 
-DB_PATH = os.path.abspath(DB)
+DB_PATH = os.path.abspath("db_deploy")
 
 @st.cache_resource(show_spinner=False)
 def load_database(db_path):
