@@ -1,45 +1,104 @@
-"""Amazon AI Assistant v2: tool-calling agent (products with photos, reviews, policies, orders, returns, compare, human hand-off).
-Log in (or continue as guest); logged-in users keep their orders and chat history.
-Needs the db/ folder, a .env file with OPENROUTER_API_KEY, and (optional, for photos) images.json next to this file."""
-import os, re, time, json, html, uuid
-import chromadb, pandas as pd, streamlit as st
-from dotenv import load_dotenv
-from openai import OpenAI
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import config, orders, auth
-from config import DB, EMBED_MODEL, RERANK_MODEL, LLM_BASE_URL, LLM_MODEL
-from agent import Toolbox, build_system, run_agent
-LLM_FALLBACK = getattr(config, "LLM_FALLBACK", None)
+"""Amazon AI Assistant: product search, reviews, policies, demo orders, and chat."""
 
-st.set_page_config(page_title="Amazon AI Assistant", page_icon="🛒")
+# Import Streamlit first so the page can show diagnostics before loading heavy AI libraries.
+import os
+import re
+import time
+import json
+import html
+import uuid
+import traceback
+import streamlit as st
 
-@st.cache_resource
-def load():
-    db = chromadb.PersistentClient(path=DB)
-    cols, errors = {}, {}
-    for n in ("policy", "products", "reviews"):
-        try: cols[n] = db.get_collection(n)
-        except Exception as e: cols[n], errors[n] = None, repr(e)
-    return SentenceTransformer(EMBED_MODEL), CrossEncoder(RERANK_MODEL), cols, errors
+st.set_page_config(page_title="Amazon AI Assistant", page_icon="🛒", layout="wide")
+st.title("🛒 Amazon AI Shopping Intelligence Assistant")
+st.caption("Starting the application. The first startup can take several minutes while AI models download.")
 
-@st.cache_data
-def load_images():
-    """images.json (made by extract_images.py) maps product id -> image URL. Optional."""
-    try: return json.load(open("images.json"))
-    except Exception: return {}
-
-model, reranker, cols, errors = load()
-IMAGES = load_images()
-if cols["products"] is None:
-    st.error(f"Product index not found in '{os.path.abspath(DB)}'. Error: {errors.get('products')}\n\n"
-             "Unzip the db/ folder from Colab next to app.py, then restart.")
+# Load dependencies after showing the page, so import errors are visible in the app.
+try:
+    import chromadb
+    import pandas as pd
+    from dotenv import load_dotenv
+    from openai import OpenAI
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+    import config, orders, auth
+    from config import DB, EMBED_MODEL, RERANK_MODEL, LLM_BASE_URL, LLM_MODEL
+    from agent import Toolbox, build_system, run_agent
+    LLM_FALLBACK = getattr(config, "LLM_FALLBACK", None)
+except Exception as e:
+    st.error("The application could not import one or more dependencies.")
+    st.exception(e)
+    st.code(traceback.format_exc())
     st.stop()
+
 load_dotenv()
-API_KEY = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or "").strip().strip("\"'“”‘’")
+try:
+    API_KEY = (
+        os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("OPENROUTER_KEY")
+        or st.secrets.get("OPENROUTER_API_KEY", "")
+    ).strip().strip("\"'“”‘’")
+except Exception:
+    API_KEY = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or "").strip().strip("\"'“”‘’")
+
 if not API_KEY:
-    st.error("OPENROUTER_API_KEY not found. Create a .env file next to app.py.")
+    st.error("OPENROUTER_API_KEY is missing. Add it in Streamlit Cloud → App settings → Secrets.")
+    st.info('Add this entry to Secrets: OPENROUTER_API_KEY = "your_actual_key"')
     st.stop()
+
 llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
+
+DB_PATH = os.path.abspath(DB)
+
+@st.cache_resource(show_spinner=False)
+def load_database(db_path):
+    """Open the local ChromaDB directory and return the collections that exist."""
+    db = chromadb.PersistentClient(path=db_path)
+    cols, errors = {}, {}
+    for name in ("policy", "products", "reviews"):
+        try:
+            cols[name] = db.get_collection(name)
+        except Exception as e:
+            cols[name] = None
+            errors[name] = repr(e)
+    return cols, errors
+
+@st.cache_resource(show_spinner=False)
+def load_models(embed_name, rerank_name):
+    """Load cached embedding and reranking models."""
+    embedding_model = SentenceTransformer(embed_name)
+    reranking_model = CrossEncoder(rerank_name)
+    return embedding_model, reranking_model
+
+@st.cache_data(show_spinner=False)
+def load_images():
+    """images.json is optional; it maps product IDs to image URLs."""
+    try:
+        with open("images.json", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+# Initialize the database first. Do not spend time downloading AI models if the index is missing.
+try:
+    with st.status("Checking the product database...", expanded=True) as startup_status:
+        st.write(f"Database path: `{DB_PATH}`")
+        cols, errors = load_database(DB_PATH)
+        if cols.get("products") is None:
+            st.error(f"The required ChromaDB 'products' collection was not found. Details: {errors.get('products', 'No collection available')}")
+            st.warning("The `db/` directory must be available beside app.py in the deployed app. Your .gitignore excludes db/, so it will not be pushed by Git unless you deliberately change that setup.")
+            st.stop()
+
+        st.write("Product collection found. Loading embedding and reranker models; first startup may take several minutes...")
+        model, reranker = load_models(EMBED_MODEL, RERANK_MODEL)
+        startup_status.update(label="Database and AI models loaded", state="complete", expanded=False)
+except Exception as e:
+    st.error("Application startup failed while opening the database or loading AI models.")
+    st.exception(e)
+    st.code(traceback.format_exc())
+    st.stop()
+
+IMAGES = load_images()
 
 def complete(msgs, tools=None, max_tokens=800):
     """One LLM call: retry on rate limit, shrink max_tokens when credit is low (402), fall back to a second model."""
